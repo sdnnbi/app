@@ -1,0 +1,268 @@
+package com.stubhub.domain.search.apps.driver.solrclient.impl;
+
+import java.io.IOException;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+
+import org.apache.commons.collections.MapUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.time.StopWatch;
+import org.apache.solr.client.solrj.SolrClient;
+import org.apache.solr.client.solrj.SolrQuery;
+import org.apache.solr.client.solrj.SolrServerException;
+import org.apache.solr.client.solrj.response.QueryResponse;
+import org.apache.solr.common.SolrException;
+import org.apache.solr.common.SolrException.ErrorCode;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.InitializingBean;
+import org.springframework.data.solr.core.query.Criteria;
+import org.springframework.data.solr.core.query.SimpleFacetQuery;
+import org.springframework.data.solr.core.query.SimpleQuery;
+
+import com.stubhub.domain.search.apps.driver.common.response.IdentifiableSearchBean;
+import com.stubhub.domain.search.apps.driver.pipeline.PipelineManager;
+import com.stubhub.domain.search.apps.driver.pipeline.record.QueryRecord;
+import com.stubhub.domain.search.apps.driver.pipeline.record.ResponseRecord;
+import com.stubhub.domain.search.apps.driver.solrclient.SolrLocator;
+import com.stubhub.domain.search.apps.driver.solrclient.StubHubSearchClient;
+import com.stubhub.domain.search.apps.driver.solrclient.binder.ResponseBeanBinder;
+import com.stubhub.domain.search.apps.driver.solrclient.query.SearchQuery;
+import com.stubhub.domain.search.apps.driver.solrclient.query.SearchQueryParser;
+import com.stubhub.domain.search.apps.driver.solrclient.query.SearchQueryResult;
+import com.stubhub.domain.search.apps.driver.solrclient.query.impl.SearchQueryCursorResultImpl;
+import com.stubhub.domain.search.apps.driver.solrclient.query.impl.SearchQueryGroupResultsImpl;
+import com.stubhub.domain.search.apps.driver.solrclient.query.impl.SearchQueryImpl;
+import com.stubhub.domain.search.apps.driver.solrclient.query.impl.SearchQueryListResultImpl;
+import com.stubhub.domain.search.apps.driver.solrclient.solr.SolrUtil;
+
+/**
+ *
+ * @author Gopal Patwa<gpatwa@stubhub.com>
+ *
+ */
+public class StubHubSearchClientImpl implements StubHubSearchClient, InitializingBean {
+	private static final Logger LOG = LoggerFactory.getLogger(StubHubSearchClientImpl.class);
+	private int maxRetry = 3;
+	private SolrClient solrClient;
+	private SolrLocator solrLocator;
+	private List<ResponseBeanBinder> responseBeanBinders;
+
+	private SearchQueryParser searchQueryParser;
+	private Map<String, PipelineManager<QueryRecord>> queryPipelineManagerMap;
+	private PipelineManager<QueryRecord> defaultQueryPipelineManager;
+	private Map<String, PipelineManager<ResponseRecord>> responsePipelineManagerMap;
+	private PipelineManager<ResponseRecord> defaultResponsePipelineManager;
+
+	@Override
+	public SearchQuery createQuery(Criteria criteria) {
+		if (criteria != null) {
+			return new SearchQueryImpl(new SimpleQuery(criteria));
+		} else {
+			return new SearchQueryImpl(new SimpleQuery());
+		}
+	}
+
+	@Override
+	public SearchQuery createFacetQuery(Criteria criteria) {
+		if (criteria != null) {
+			return new SearchQueryImpl(new SimpleFacetQuery(criteria));
+		} else {
+			return new SearchQueryImpl(new SimpleFacetQuery());
+		}
+	}
+
+	@Override
+	public SearchQuery createFilterQuery(Criteria criteria) {
+		if (criteria != null) {
+			return new SearchQueryImpl(new SimpleQuery(criteria));
+		} else {
+			return new SearchQueryImpl(new SimpleQuery());
+		}
+	}
+
+	@Override
+	public SolrClient getSolrServer() throws SolrServerException {
+		return solrClient;
+	}
+
+	@Override
+	public SolrClient getSolrClient() throws SolrServerException {
+		return getSolrServer();
+	}
+
+	@Override
+	public SearchQueryResult<IdentifiableSearchBean> query(SearchQuery searchQuery) throws SolrServerException,
+			IOException {
+		LOG.debug("Before solr query build, searchQuery={}", searchQuery);
+		SolrQuery solrQuery = searchQueryParser.constructSolrQuery(searchQuery);
+		String collection = searchQuery.getCollection();
+		if (StringUtils.isNotBlank(collection)) {
+			solrQuery.set("collection", collection);
+		}
+		LOG.debug("After solr query build, solrQuery={}", solrQuery);
+		invokeQueryPipeline(searchQuery, solrQuery);
+		return query(solrQuery, searchQuery.getBeanClass(), searchQuery.getLocales(), searchQuery);
+	}
+
+	private void invokeQueryPipeline(SearchQuery searchQuery, SolrQuery solrQuery) {
+		PipelineManager<QueryRecord> pipelineManager = this.defaultQueryPipelineManager;
+		String queryPipelineId = searchQuery.getQueryPipelineId();
+		if (MapUtils.isNotEmpty(queryPipelineManagerMap) && StringUtils.isNotBlank(queryPipelineId)) {
+			pipelineManager = queryPipelineManagerMap.get(queryPipelineId);
+		}
+		if (pipelineManager != null) {
+			QueryRecord queryRecord = new QueryRecord(solrQuery, searchQuery.getShServiceContext(),
+					searchQuery.getMessageContext());
+			queryRecord.getValueMap().putAll(searchQuery.getValueMap());
+			LOG.debug("Before query pipeline, solrQuery={}", solrQuery);
+			pipelineManager.processRecord(queryRecord);
+			LOG.debug("After query pipeline, solrQuery={}", solrQuery);
+		}
+	}
+
+	private SearchQueryResult<IdentifiableSearchBean> query(SolrQuery solrQuery,
+			Class<? extends IdentifiableSearchBean> clazz, List<Locale> locales, SearchQuery searchQuery)
+			throws SolrServerException, IOException {
+		LOG.debug("before query, solrQuery={}", solrQuery);
+		StopWatch sw = null;
+		if (LOG.isDebugEnabled()) {
+			sw = new StopWatch();
+			sw.start();
+		}
+		int i = 1;
+		QueryResponse rsp = null;
+		SolrException lastException = null;
+		while (i <= this.maxRetry) {
+			try {
+				rsp = SolrUtil.query(getSolrClient(), solrQuery, searchQuery.getQueryRequestMethod());
+			} catch (SolrException e) {
+				LOG.warn("Got SolrException during query {}", i, e);
+				lastException = e;
+			}
+			if (rsp != null) {
+				break;
+			}
+			i++;
+		}
+		if (rsp == null) {
+			if (lastException != null) {
+				throw lastException;
+			} else {
+				throw new SolrException(ErrorCode.UNKNOWN, "queryResponse is null");
+			}
+		}
+		try {
+			PipelineManager<ResponseRecord> pipelineManager = this.defaultResponsePipelineManager;
+			String queryPipelineId = searchQuery.getQueryPipelineId();
+			if (MapUtils.isNotEmpty(responsePipelineManagerMap) && StringUtils.isNotBlank(queryPipelineId)) {
+				pipelineManager = responsePipelineManagerMap.get(queryPipelineId);
+			}
+			if (pipelineManager != null) {
+				ResponseRecord responseRecord = new ResponseRecord(rsp);
+				responseRecord.getValueMap().putAll(searchQuery.getValueMap());
+				LOG.debug("Before response pipeline, QueryResponse={}", rsp);
+				pipelineManager.processRecord(responseRecord);
+				LOG.debug("After response pipeline, QueryResponse={}", rsp);
+			}
+
+			ResponseBeanBinder binder = getResponseBeanBinder(clazz);
+			if (rsp.getNextCursorMark() != null) {
+				return new SearchQueryCursorResultImpl(solrQuery, rsp, solrClient, searchQuery.getQueryRequestMethod(),
+						clazz, binder, locales);
+			} else if (rsp.getGroupResponse() != null) {
+				return new SearchQueryGroupResultsImpl(rsp, clazz, binder, locales);
+			} else {
+				return new SearchQueryListResultImpl(rsp, clazz, binder, locales);
+			}
+
+		} finally {
+			if (LOG.isDebugEnabled() && sw != null) {
+				LOG.debug("query was done, costInMS={} solrQuery={} ", sw.getTime(), solrQuery);
+			}
+		}
+	}
+
+	private ResponseBeanBinder getResponseBeanBinder(Class<? extends IdentifiableSearchBean> clazz) {
+		ResponseBeanBinder binder = null;
+		for (ResponseBeanBinder responseBeanBinder : responseBeanBinders) {
+			if (responseBeanBinder.canBind(clazz)) {
+				binder = responseBeanBinder;
+				break;
+			}
+		}
+		return binder;
+	}
+
+	@Override
+	public void afterPropertiesSet() throws Exception {
+		this.solrClient = solrLocator.createSolrClient();
+		LOG.debug("solrServer={}", solrClient);
+	}
+
+	/**
+	 * @param solrLocator
+	 *            the solrLocator to set
+	 */
+	public void setSolrLocator(SolrLocator solrLocator) {
+		this.solrLocator = solrLocator;
+	}
+
+	/**
+	 * @param responseBeanBinders
+	 *            the responseBeanBinders to set
+	 */
+	public void setResponseBeanBinders(List<ResponseBeanBinder> responseBeanBinders) {
+		this.responseBeanBinders = responseBeanBinders;
+	}
+
+	/**
+	 * @param searchQueryParser
+	 *            the searchQueryParser to set
+	 */
+	public void setSearchQueryParser(SearchQueryParser searchQueryParser) {
+		this.searchQueryParser = searchQueryParser;
+	}
+
+	/**
+	 * @param queryPipelineManagerMap
+	 *            the queryPipelineManagerMap to set
+	 */
+	public void setQueryPipelineManagerMap(Map<String, PipelineManager<QueryRecord>> queryPipelineManagerMap) {
+		this.queryPipelineManagerMap = queryPipelineManagerMap;
+	}
+
+	/**
+	 * @param responsePipelineManagerMap
+	 *            the responsePipelineManagerMap to set
+	 */
+	public void setResponsePipelineManagerMap(Map<String, PipelineManager<ResponseRecord>> responsePipelineManagerMap) {
+		this.responsePipelineManagerMap = responsePipelineManagerMap;
+	}
+
+	/**
+	 * @param defaultQueryPipelineManager
+	 *            the defaultQueryPipelineManager to set
+	 */
+	public void setDefaultQueryPipelineManager(PipelineManager<QueryRecord> defaultQueryPipelineManager) {
+		this.defaultQueryPipelineManager = defaultQueryPipelineManager;
+	}
+
+	/**
+	 * @param defaultResponsePipelineManager
+	 *            the defaultResponsePipelineManager to set
+	 */
+	public void setDefaultResponsePipelineManager(PipelineManager<ResponseRecord> defaultResponsePipelineManager) {
+		this.defaultResponsePipelineManager = defaultResponsePipelineManager;
+	}
+
+	/**
+	 * @param maxRetry
+	 *            the maxRetry to set
+	 */
+	public void setMaxRetry(int maxRetry) {
+		this.maxRetry = maxRetry;
+	}
+
+}
